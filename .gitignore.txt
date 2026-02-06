@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+Resultados_*/
+*.pickle
+*.pkl
+*.csv
+*.log
+*.png
+
+.DS_Store
+.vscode/
+.idea/
