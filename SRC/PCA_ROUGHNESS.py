@@ -150,8 +150,8 @@ def analyze_file(filepath, output_dir, log_file, radius=0.5):
 
 # EXECUÇÃO
 if __name__ == "__main__":
-    input_dir = r"D:\Users\Gleicon\Documents\DOUTORADO - UFRGS\TESE\TRECHOS LEVANTAMENTOS"
-    output_dir = os.path.join(input_dir, "Resultados_05.02.26")
+    input_dir = r"INSIRA O CAMINHO DAS NUVENS DE PONTOS"
+    output_dir = os.path.join(input_dir, "INSIRA O CAMINHO DE DESTINO")
     os.makedirs(output_dir, exist_ok=True)
 
     arquivos = [os.path.join(input_dir, f) for f in os.listdir(
