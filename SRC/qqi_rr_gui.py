@@ -9,7 +9,7 @@ qqi_rr_gui.py — App Tkinter para:
 
 Calibração:
 - Lê dados brutos (GSD, QQI (10^-4), RR) diretamente do Excel:
-  D:\Users\Gleicon\Documents\DOUTORADO - UFRGS\TESE\Calibrador do QQI_RR_GUI.xlsx
+  Calibrador do QQI_RR_GUI.xlsx
 
 Robustez:
 - Winsorização por grupo (GSD_bin, RR) em P5–P95 (quando N >= 8)
@@ -30,6 +30,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import queue
 
+import laspy
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -45,7 +46,7 @@ RESULTS_DIRNAME = "Resultados_QQI_RR"
 MAX_RR_HALFSTEP = 5.5
 
 # ============= Caminho da calibração (Excel) =============
-CALIB_XLSX_PATH = r"D:\Users\Gleicon\Documents\DOUTORADO - UFRGS\TESE\Calibrador do QQI_RR_GUI.xlsx"
+CALIB_XLSX_PATH = r"INSIRA SEU CAMINHO DO ARQUIVO"
 
 # ============= Robustez (outliers / bins instáveis) =============
 WINSOR_LO = 0.05
@@ -336,7 +337,17 @@ def process_point(point, df, neigh):
 
 def read_cloud(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
-    if ext in [".xlsx", ".xls"]:
+    if ext == ".las":
+        las = laspy.read(path)
+
+        df = pd.DataFrame({
+            "x": las.x,
+            "y": las.y,
+            "z": las.z
+        })
+        return df
+
+    elif ext in [".xlsx", ".xls"]:
         return pd.read_excel(path, header=None)
     elif ext == ".csv":
         try:
@@ -346,7 +357,7 @@ def read_cloud(path: str) -> pd.DataFrame:
     elif ext == ".txt":
         return pd.read_csv(path, sep=r'\s+', header=None, engine='python', skiprows=1)
     else:
-        raise ValueError("Formato não suportado. Use .xlsx, .csv ou .txt")
+        raise ValueError("Formato não suportado. Use .las, .xlsx, .csv ou .txt")
 
 class QQICalculator:
     @staticmethod
@@ -476,8 +487,8 @@ class QQIApp(tk.Tk):
     def pick_file(self):
         path = filedialog.askopenfilename(
             title="Selecione a nuvem de pontos",
-            filetypes=[("Padrões aceitos", "*.xlsx *.xls *.csv *.txt"),
-                       ("Excel", "*.xlsx *.xls"), ("CSV", "*.csv"), ("TXT", "*.txt")]
+            filetypes=[("Padrões aceitos", "*.las *.xlsx *.xls *.csv *.txt"),
+                       ("LAS", "*.las"), ("Excel", "*.xlsx *.xls"), ("CSV", "*.csv"), ("TXT", "*.txt")]
         )
         if path:
             self.cloud_path.set(path)
