@@ -54,7 +54,7 @@ RESULTS_DIRNAME = "Resultados_QQI_RR"
 # geométrica entre bins com diferentes densidades de referência.
 KNN_MIN_RATIO = 0.15
 
-CALIB_XLSX_PATH = r"D:\Users\Gleicon\Documents\DOUTORADO - UFRGS\TESE\Calibrador_QQI_RR_P75_v4.xlsx"
+CALIB_XLSX_PATH = r"INSIRA AQUI O CAMINHO DO CALIBRADOR"
 
 
 # =========================
