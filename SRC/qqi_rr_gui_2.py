@@ -2,27 +2,38 @@
 r"""
 qqi_rr_gui_limiares.py — GUI Tkinter (SEM classificador)
 
-- QQI calculado como (Rugosidade * Theta) / REF_KNN
+- QQI calculado como (Rugosidade * Theta) / KNN_ref_efetivo
 - RR estimado por limiares (t23, t34, t45) por GSD_bin
 - Calibrador vem de um Excel com abas: LIMIARES e GLOBAL
 
-RESULTADO FINAL (para não confundir usuário):
-- Exibe APENAS UM RR FINAL (decimal): média truncada (5–95%) do RR_est (mapa).
-  Isso produz valores como RR=2.68 e é robusto a outliers.
+REGRA DE NORMALIZAÇÃO:
+- O modelo usa aproximação por vizinho mais próximo dentro da amplitude calibrada
+  de GSD, assumindo continuidade do comportamento do índice entre os bins.
+- Se o GSD informado estiver dentro dessa amplitude e o bin selecionado possuir
+  KNN_ref válido, o QQI é normalizado pelo KNN_ref do bin correspondente.
+- Se o GSD estiver fora dessa amplitude, ou se o bin selecionado não possuir
+  KNN_ref válido, usa-se o REF_KNN global como fallback.
 
-Observação:
-- Ajuste QQI_ESCALA para bater com a escala do seu Excel.
-  Você disse que o QQI da base já está multiplicado por 10^5, então:
-  QQI_ESCALA = 1e5
+RESULTADO FINAL:
+- Exibe APENAS UM RR FINAL baseado na MODA PONDERADA do RR_est (mapa).
+  RR é uma variável ordinal discreta — a moda (valor mais frequente) é mais
+  representativa do que a média, que é puxada por pontos de ruído na nuvem.
+  O resultado decimal vem da média ponderada das classes dominantes (>= 20% da moda).
+
+ESCALA:
+- QQI_ESCALA = 1e5
+- REF_KNN global = valor da aba GLOBAL, usado apenas como fallback
 """
 
 import os
+import re
 import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import queue
 
+import laspy
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -36,69 +47,184 @@ import matplotlib.pyplot as plt
 DEFAULT_RADIUS = 0.5
 N_JOBS = -1
 
-QQI_ESCALA = 1e5  # sua base já está em 10^5
+QQI_ESCALA = 1e5
 RESULTS_DIRNAME = "Resultados_QQI_RR"
 
-CALIB_XLSX_PATH = r"D:\Users\Gleicon\Documents\DOUTORADO - UFRGS\TESE\TESTE\Calibrador_LIMIARES.xlsx"
+# O filtro de densidade acompanha o KNN_ref_efetivo para manter consistência
+# geométrica entre bins com diferentes densidades de referência.
+KNN_MIN_RATIO = 0.15
+
+CALIB_XLSX_PATH = r"D:\Users\Gleicon\Documents\DOUTORADO - UFRGS\TESE\Calibrador_QQI_RR_P75_v4.xlsx"
 
 
 # =========================
 # Leitura do Calibrador
 # =========================
+def _normalize_excel_colname(name):
+    text = str(name).strip().replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.lower()
+
+
+def _rename_excel_columns(df, alias_map):
+    rename_map = {}
+    for col in df.columns:
+        key = _normalize_excel_colname(col)
+        if key in alias_map:
+            rename_map[col] = alias_map[key]
+    return df.rename(columns=rename_map)
+
+
 def load_threshold_calibrator(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Calibrador não encontrado: {path}")
 
-    df_lim = pd.read_excel(path, sheet_name="LIMIARES")
-    df_glb = pd.read_excel(path, sheet_name="GLOBAL")
+    df_lim = pd.read_excel(path, sheet_name="LIMIARES", header=1)
+    df_glb = pd.read_excel(path, sheet_name="GLOBAL", header=1)
 
-    # limpa
+    # limpa colunas
     df_lim.columns = [str(c).strip() for c in df_lim.columns]
-    for c in ["GSD_bin", "REF_KNN", "t23", "t34", "t45"]:
+    df_glb.columns = [str(c).strip() for c in df_glb.columns]
+
+    lim_alias_map = {
+        "gsd_bin": "GSD_bin",
+        "gsd_bin (cm/px)": "GSD_bin",
+        "gsd_bin(cm/px)": "GSD_bin",
+        "ref_knn": "KNN_ref",
+        "ref_knn (mediana)": "KNN_ref",
+        "ref_knn(mediana)": "KNN_ref",
+        "knn_ref": "KNN_ref",
+        "knn_ref (mediana)": "KNN_ref",
+        "knn_ref(mediana)": "KNN_ref",
+        "knn_bin": "KNN_ref",
+        "t23": "t23",
+        "t23 (rr2->3)": "t23",
+        "t23 (rr2→3)": "t23",
+        "t34": "t34",
+        "t34 (rr3->4)": "t34",
+        "t34 (rr3→4)": "t34",
+        "t45": "t45",
+        "t45 (rr4->5)": "t45",
+        "t45 (rr4→5)": "t45",
+    }
+    glb_alias_map = {
+        "ref_knn": "REF_KNN",
+        "ref_knn (mediana)": "REF_KNN",
+        "ref_knn(mediana)": "REF_KNN",
+        "t23": "t23",
+        "t34": "t34",
+        "t45": "t45",
+    }
+
+    df_lim = _rename_excel_columns(df_lim, lim_alias_map)
+    df_glb = _rename_excel_columns(df_glb, glb_alias_map)
+    df_lim = df_lim.dropna(how="all").copy()
+    df_glb = df_glb.dropna(how="all").reset_index(drop=True)
+
+    missing_lim = [c for c in ["GSD_bin", "t23"] if c not in df_lim.columns]
+    if missing_lim:
+        raise ValueError(f"Colunas obrigatórias ausentes na aba LIMIARES: {missing_lim}")
+
+    missing_glb = [c for c in ["t23", "t34", "t45"] if c not in df_glb.columns]
+    if missing_glb:
+        raise ValueError(f"Colunas obrigatórias ausentes na aba GLOBAL: {missing_glb}")
+
+    # Lê todas as colunas numéricas relevantes, incluindo KNN_ref se existir
+    for c in ["GSD_bin", "t23", "t34", "t45", "KNN_ref"]:
         if c in df_lim.columns:
             df_lim[c] = pd.to_numeric(df_lim[c], errors="coerce")
 
-    ref_knn = float(pd.to_numeric(df_glb.loc[0, "REF_KNN"], errors="coerce"))
-    if not np.isfinite(ref_knn) or ref_knn <= 0:
-        ref_knn = 50.0
+    for c in ["REF_KNN", "t23", "t34", "t45"]:
+        if c in df_glb.columns:
+            df_glb[c] = pd.to_numeric(df_glb[c], errors="coerce")
 
-    t23g = float(pd.to_numeric(df_glb.loc[0, "t23"], errors="coerce"))
-    t34g = float(pd.to_numeric(df_glb.loc[0, "t34"], errors="coerce"))
-    t45g = float(pd.to_numeric(df_glb.loc[0, "t45"], errors="coerce"))
+    if len(df_glb) == 0:
+        raise ValueError("A aba GLOBAL está vazia ou inválida.")
+
+    global_row = df_glb.iloc[0]
+
+    # lê REF_KNN da aba GLOBAL
+    ref_knn_global = float(pd.to_numeric(global_row.get("REF_KNN"), errors="coerce"))
+    if not np.isfinite(ref_knn_global) or ref_knn_global <= 0:
+        ref_knn_global = 68.70  # fallback: mediana da base de calibração
+
+    t23g = float(pd.to_numeric(global_row.get("t23"), errors="coerce"))
+    t34g = float(pd.to_numeric(global_row.get("t34"), errors="coerce"))
+    t45g = float(pd.to_numeric(global_row.get("t45"), errors="coerce"))
+    if not all(np.isfinite(v) for v in [t23g, t34g, t45g]):
+        raise ValueError("Os limiares globais t23/t34/t45 estão ausentes ou inválidos na aba GLOBAL.")
     global_thr = {"t23": t23g, "t34": t34g, "t45": t45g}
 
-    df_lim = df_lim.dropna(subset=["GSD_bin", "t23", "t34", "t45"]).copy()
+    # Exige apenas GSD_bin e t23 válidos
+    df_lim = df_lim.dropna(subset=["GSD_bin", "t23"]).copy()
     df_lim = df_lim.sort_values("GSD_bin").reset_index(drop=True)
+
     if len(df_lim) == 0:
         raise ValueError("A aba LIMIARES está vazia ou inválida.")
 
-    return df_lim, global_thr, ref_knn
+    return df_lim, global_thr, ref_knn_global
 
 
 def nearest_bin_thresholds(df_lim, gsd_val, global_thr):
     """
-    Busca o GSD_bin mais próximo (em valor absoluto) e retorna t23,t34,t45.
-    Se algo falhar, retorna GLOBAL.
+    Resolve o bin de GSD mais próximo e retorna:
+    - GSD_bin selecionado
+    - limiares t23, t34, t45
+    - KNN_ref do bin, se disponível
+    - flag 'in_range', que indica apenas se o GSD informado está dentro da
+      amplitude total calibrada [min(GSD_bin), max(GSD_bin)]
+
+    Observação:
+    - Dentro da amplitude calibrada de GSD, usa-se o bin mais próximo.
+    - Fora dessa amplitude, o chamador deve usar o REF_KNN global como fallback.
+    - t34 e t45 podem usar fallback global caso estejam ausentes no bin.
+    - Não há validação explícita da distância entre o GSD informado e o bin mais
+      próximo; assume-se que o calibrador possui densidade suficiente de bins.
     """
     try:
-        idx = int(np.argmin(np.abs(df_lim["GSD_bin"].values - float(gsd_val))))
+        gsd_val = float(gsd_val)
+        gsd_bins = df_lim["GSD_bin"].values.astype(float)
+
+        gsd_min = float(np.nanmin(gsd_bins))
+        gsd_max = float(np.nanmax(gsd_bins))
+        in_range = (gsd_val >= gsd_min) and (gsd_val <= gsd_max)
+
+        idx = int(np.argmin(np.abs(gsd_bins - gsd_val)))
         row = df_lim.iloc[idx]
+
+        t23 = float(row["t23"])
+        t34 = float(row["t34"]) if pd.notna(row.get("t34")) else global_thr["t34"]
+        t45 = float(row["t45"]) if pd.notna(row.get("t45")) else global_thr["t45"]
+
+        # KNN_ref do bin — None se coluna ausente ou valor NaN
+        knn_bin = None
+        if "KNN_ref" in df_lim.columns and pd.notna(row.get("KNN_ref")):
+            knn_bin = float(row["KNN_ref"])
+
         return {
             "GSD_bin": float(row["GSD_bin"]),
-            "t23": float(row["t23"]),
-            "t34": float(row["t34"]),
-            "t45": float(row["t45"]),
+            "t23": t23,
+            "t34": t34,
+            "t45": t45,
+            "KNN_bin": knn_bin,
+            "in_range": in_range,
+            "gsd_min": gsd_min,
+            "gsd_max": gsd_max,
         }
     except Exception:
-        return {"GSD_bin": None, **global_thr}
+        return {
+            "GSD_bin": None,
+            "t23": global_thr["t23"],
+            "t34": global_thr["t34"],
+            "t45": global_thr["t45"],
+            "KNN_bin": None,
+            "in_range": False,
+            "gsd_min": None,
+            "gsd_max": None,
+        }
 
 
 def rr_from_thresholds(qqi_scaled, thr):
-    """
-    qqi_scaled: QQI já na escala do calibrador (ex: 10^5)
-    thr: dict com t23,t34,t45
-    Retorna RR inteiro 2..5
-    """
     t23, t34, t45 = thr["t23"], thr["t34"], thr["t45"]
     if not np.isfinite(qqi_scaled):
         return np.nan
@@ -130,7 +256,7 @@ def process_point(point, df, neigh):
 
     n_z = np.array([0, 0, 1.0])
     n_pca = pca.components_[2]
-    denom = (np.linalg.norm(n_z) * np.linalg.norm(n_pca))
+    denom = np.linalg.norm(n_z) * np.linalg.norm(n_pca)
     if denom == 0:
         theta = np.nan
     else:
@@ -142,6 +268,10 @@ def process_point(point, df, neigh):
 
 def read_cloud(path):
     ext = os.path.splitext(path)[1].lower()
+    if ext == ".las":
+        las = laspy.read(path)
+        df = pd.DataFrame({"x": las.x, "y": las.y, "z": las.z})
+        return df
     if ext in [".xlsx", ".xls"]:
         return pd.read_excel(path, header=None)
     if ext == ".csv":
@@ -151,7 +281,7 @@ def read_cloud(path):
         return df
     if ext == ".txt":
         return pd.read_csv(path, sep=r'\s+', header=None, engine='python', skiprows=1)
-    raise ValueError("Formato não suportado. Use txt/csv/xlsx.")
+    raise ValueError("Formato não suportado. Use LAS, TXT ou CSV.")
 
 
 class QQICalculator:
@@ -170,12 +300,8 @@ class QQICalculator:
         df_xyz["Theta"] = np.array(thetas, dtype=float)
         df_xyz["KNN"] = np.array(knns, dtype=float)
 
-        # QQI normalizado pela densidade de referência (não depende do KNN local)
-        pca_index = df_xyz["Rugosidade"] * df_xyz["Theta"]  # escala "pequena"
-        if ref_knn > 0:
-            df_xyz["QQI"] = pca_index / ref_knn
-        else:
-            df_xyz["QQI"] = np.nan
+        pca_index = df_xyz["Rugosidade"] * df_xyz["Theta"]
+        df_xyz["QQI"] = pca_index / ref_knn if ref_knn > 0 else np.nan
 
         return df_xyz
 
@@ -211,7 +337,7 @@ class QQICalculator:
 class QQIApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("QQI & RR — Resultado Único (média truncada)")
+        self.title("QQI & RR — Resultado Único")
         self.geometry("880x720")
         self.resizable(True, True)
 
@@ -222,7 +348,7 @@ class QQIApp(tk.Tk):
 
         self.df_lim = None
         self.global_thr = None
-        self.ref_knn = 50.0
+        self.ref_knn_global = 68.70
         self.last_rr_map = None
 
         frm = ttk.Frame(self, padding=20)
@@ -231,7 +357,7 @@ class QQIApp(tk.Tk):
         frm.columnconfigure(1, weight=1)
         frm.columnconfigure(2, weight=1)
 
-        ttk.Label(frm, text="Arquivo da nuvem (txt/csv/xlsx):", font=("Segoe UI", 10, "bold")).grid(
+        ttk.Label(frm, text="Arquivo da nuvem (LAS/TXT/CSV):", font=("Segoe UI", 10, "bold")).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 5)
         )
         ttk.Entry(frm, textvariable=self.cloud_path).grid(row=1, column=0, columnspan=2, sticky="ew", padx=(0, 10), ipady=3)
@@ -239,7 +365,7 @@ class QQIApp(tk.Tk):
 
         ttk.Label(frm, text="GSD (cm/px):", font=("Segoe UI", 9)).grid(row=2, column=0, sticky="w", pady=(15, 2))
         ttk.Label(frm, text="Raio Busca (m):", font=("Segoe UI", 9)).grid(row=2, column=1, sticky="w", pady=(15, 2))
-        ttk.Label(frm, text="REF_KNN (do calibrador):", font=("Segoe UI", 9)).grid(row=2, column=2, sticky="w", pady=(15, 2))
+        ttk.Label(frm, text="REF_KNN global (fallback):", font=("Segoe UI", 9)).grid(row=2, column=2, sticky="w", pady=(15, 2))
 
         ttk.Entry(frm, textvariable=self.gsd_val).grid(row=3, column=0, sticky="ew", padx=(0, 5), ipady=3)
         ttk.Entry(frm, textvariable=self.rad_val).grid(row=3, column=1, sticky="ew", padx=(0, 5), ipady=3)
@@ -247,8 +373,16 @@ class QQIApp(tk.Tk):
         self.lbl_ref = ttk.Label(frm, text="(carregando...)", font=("Segoe UI", 9, "bold"))
         self.lbl_ref.grid(row=3, column=2, sticky="w")
 
+        # Mostra o KNN efetivo realmente usado no cálculo do QQI.
+        ttk.Label(frm, text="KNN efetivo usado no QQI:", font=("Segoe UI", 9)).grid(
+            row=4, column=0, sticky="w", pady=(10, 2)
+        )
+        self.lbl_knn_bin = ttk.Label(frm, text="—", font=("Segoe UI", 9, "bold"))
+        self.lbl_knn_bin.grid(row=4, column=1, sticky="w", pady=(10, 2))
+        # ────────────────────────────────────────────────────────────────────
+
         self.btn_calc = ttk.Button(frm, text="CALCULAR", command=self.start)
-        self.btn_calc.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(25, 10), ipady=5)
+        self.btn_calc.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(20, 10), ipady=5)
 
         self.btn_open = ttk.Button(frm, text="Abrir Mapa RR", command=self.open_map, state="disabled")
         self.btn_open.grid(row=6, column=0, columnspan=3, sticky="ew", pady=5, ipady=2)
@@ -266,15 +400,25 @@ class QQIApp(tk.Tk):
 
     def load_calibrator(self):
         try:
-            self.df_lim, self.global_thr, self.ref_knn = load_threshold_calibrator(CALIB_XLSX_PATH)
-            self.lbl_ref.config(text=f"{self.ref_knn:.2f}")
-            self.lbl_res.config(text=f"Calibrador OK | REF_KNN={self.ref_knn:.2f} | bins={len(self.df_lim)}")
+            self.df_lim, self.global_thr, self.ref_knn_global = load_threshold_calibrator(CALIB_XLSX_PATH)
+            self.lbl_ref.config(text=f"{self.ref_knn_global:.2f}")
+            self.lbl_res.config(
+                text=f"Calibrador OK | REF_KNN global (fallback)={self.ref_knn_global:.2f} | bins={len(self.df_lim)}"
+            )
         except Exception as e:
             self.lbl_res.config(text="Erro ao carregar calibrador.")
             messagebox.showerror("Erro", f"Falha ao carregar calibrador:\n{e}")
 
     def pick_file(self):
-        f = filedialog.askopenfilename()
+        f = filedialog.askopenfilename(
+            filetypes=[
+                ("Nuvens de pontos", "*.las *.txt *.csv"),
+                ("LAS", "*.las"),
+                ("TXT", "*.txt"),
+                ("CSV", "*.csv"),
+                ("Todos os arquivos", "*.*"),
+            ]
+        )
         if f:
             self.cloud_path.set(f)
 
@@ -293,10 +437,11 @@ class QQIApp(tk.Tk):
         try:
             gsd = float(self.gsd_val.get().replace(",", "."))
             rad = float(self.rad_val.get().replace(",", "."))
-        except:
+        except Exception:
             return messagebox.showerror("Erro", "GSD e Raio devem ser numéricos.")
 
         self.btn_calc.config(state="disabled")
+        self.lbl_knn_bin.config(text="calculando...")
         self.lbl_res.config(text="Processando...")
         self.pbar.start(10)
 
@@ -306,36 +451,44 @@ class QQIApp(tk.Tk):
         try:
             df = read_cloud(path)
 
-            df_xyz = QQICalculator.compute_metrics(df, rad, self.ref_knn)
-
-            # QQI na escala do calibrador
-            df_xyz["QQI_scaled"] = df_xyz["QQI"] * QQI_ESCALA
-
-            # thresholds do bin mais próximo
             thr = nearest_bin_thresholds(self.df_lim, gsd, self.global_thr)
 
-            # RR ponto a ponto (para mapa)
+            # in_range indica apenas que o GSD está dentro da amplitude calibrada
+            # [min_bin, max_bin]; a seleção do bin segue vizinho mais próximo.
+            if thr["in_range"] and (thr.get("KNN_bin") is not None) and np.isfinite(thr["KNN_bin"]):
+                knn_eff = float(thr["KNN_bin"])
+                knn_source = "bin_gsd"
+            else:
+                knn_eff = float(self.ref_knn_global)
+                knn_source = "fallback_global"
+
+            df_xyz = QQICalculator.compute_metrics(df, rad, knn_eff)
+
+            df_xyz["QQI_scaled"] = df_xyz["QQI"] * QQI_ESCALA
+
+            # O limiar mínimo de vizinhos acompanha o KNN efetivo do bin/fallback.
+            knn_min = max(3, int(KNN_MIN_RATIO * knn_eff))
+            df_xyz["KNN_ok"] = df_xyz["KNN"] >= knn_min
+
             rr_est = np.full(len(df_xyz), np.nan, dtype=float)
             qqi_vals = df_xyz["QQI_scaled"].values
-            valid = np.isfinite(qqi_vals)
+            valid = np.isfinite(qqi_vals) & df_xyz["KNN_ok"].values
             for i in np.where(valid)[0]:
                 rr_est[i] = rr_from_thresholds(qqi_vals[i], thr)
             df_xyz["RR_est"] = rr_est
 
-            # ==========================
-            # RESULTADO ÚNICO (RR_FINAL) – MÉDIA TRUNCADA 5–95%
-            # ==========================
             rr_vals = df_xyz["RR_est"].values
             rr_vals = rr_vals[np.isfinite(rr_vals)]
 
             if rr_vals.size == 0:
                 rr_final = np.nan
             else:
-                lo, hi = np.percentile(rr_vals, [5, 95])
-                rr_trim = rr_vals[(rr_vals >= lo) & (rr_vals <= hi)]
-                rr_final = float(np.mean(rr_trim)) if rr_trim.size else float(np.mean(rr_vals))
+                classes, counts = np.unique(rr_vals, return_counts=True)
+                freq = counts / counts.sum()
+                moda_freq = freq.max()
+                mask_dom = freq >= 0.20 * moda_freq
+                rr_final = float(np.average(classes[mask_dom], weights=freq[mask_dom]))
 
-            # saída
             out_dir = os.path.join(os.path.dirname(path), RESULTS_DIRNAME)
             os.makedirs(out_dir, exist_ok=True)
             base = os.path.splitext(os.path.basename(path))[0]
@@ -349,17 +502,30 @@ class QQIApp(tk.Tk):
             map_qqi = os.path.join(out_dir, f"{base}_MAPA_QQI.png")
             QQICalculator.generate_plot(df_xyz, map_qqi, "QQI_scaled", f"QQI (escala {QQI_ESCALA:.0e})", cmap="plasma")
 
-            # resumo (CSV) — mantém métricas auditáveis
+            knn_bin = thr.get("KNN_bin")
+            knn_bin_str = f"{knn_bin:.1f}" if knn_bin is not None else "N/D"
+            knn_eff_str = f"{knn_eff:.1f}"
+
             resumo = pd.DataFrame([{
                 "Arquivo": base,
-                "GSD": gsd,
-                "Raio": rad,
-                "REF_KNN": self.ref_knn,
+                "GSD_informado": gsd,
+                "Raio_busca_m": rad,
+                "REF_KNN_global_fallback": self.ref_knn_global,
+                "KNN_bin_calibrador": knn_bin_str,
+                "KNN_efetivo_usado": knn_eff_str,
+                "Origem_KNN": knn_source,
+                "KNN_min_usado": knn_min,
                 "GSD_bin_usado": thr.get("GSD_bin", None),
-                "t23": thr["t23"], "t34": thr["t34"], "t45": thr["t45"],
-                "RR_FINAL_truncated_mean": rr_final,
+                "GSD_dentro_amplitude_calibrada": thr.get("in_range", False),
+                "Amplitude_GSD_min": thr.get("gsd_min", None),
+                "Amplitude_GSD_max": thr.get("gsd_max", None),
+                "t23": thr["t23"],
+                "t34": thr["t34"],
+                "t45": thr["t45"],
+                "RR_FINAL_moda_ponderada": rr_final,
                 "N_total": len(df_xyz),
-                "N_valid": int(np.isfinite(df_xyz["QQI_scaled"].values).sum()),
+                "N_valid": int(valid.sum()),
+                "N_descartado_baixo_KNN": int((~df_xyz["KNN_ok"]).sum()),
                 "pct_area_RR_ge4": float(np.mean(rr_vals >= 4) * 100.0) if rr_vals.size else np.nan,
             }])
             resumo.to_csv(os.path.join(out_dir, f"{base}_resumo.csv"), index=False)
@@ -368,6 +534,12 @@ class QQIApp(tk.Tk):
                 "rr_final": rr_final,
                 "map": map_rr,
                 "gsd_bin": thr.get("GSD_bin", None),
+                "knn_bin": knn_bin,
+                "knn_bin_str": knn_bin_str,
+                "knn_eff": knn_eff,
+                "knn_eff_str": knn_eff_str,
+                "knn_source": knn_source,
+                "in_range": thr.get("in_range", False),
             }))
 
         except Exception as e:
@@ -383,17 +555,25 @@ class QQIApp(tk.Tk):
                 self.last_rr_map = data["map"]
                 self.btn_open.config(state="normal")
 
-                # EXIBIÇÃO SIMPLES: APENAS UM RR
+                origem = "bin GSD" if data["knn_source"] == "bin_gsd" else "fallback global"
+                self.lbl_knn_bin.config(text=f"{data['knn_eff_str']} ({origem})")
+
                 self.lbl_res.config(
-                    text=f"RR_Estimado FINAL (média truncada): {data['rr_final']:.2f} | bin: {data['gsd_bin']}"
+                    text=(
+                        f"RR_Final: {data['rr_final']:.2f} | "
+                        f"GSD_bin: {data['gsd_bin']} | "
+                        f"KNN_efetivo: {data['knn_eff_str']} ({origem})"
+                    )
                 )
                 messagebox.showinfo(
                     "Resultado",
-                    f"RR_Estimado da): {data['rr_final']:.2f}\n"
-                    f"GSD_bin usado: {data['gsd_bin']}\n\n"
-                    "Obs.: detalhes adicionais foram salvos no resumo.csv."
+                    f"RR estimado (moda ponderada): {data['rr_final']:.2f}\n"
+                    f"GSD_bin usado: {data['gsd_bin']}\n"
+                    f"KNN efetivo usado no QQI: {data['knn_eff_str']} ({origem})\n\n"
+                    "Os detalhes completos foram salvos no arquivo resumo.csv."
                 )
             else:
+                self.lbl_knn_bin.config(text="—")
                 messagebox.showerror("Erro", data)
                 self.lbl_res.config(text="Erro.")
         except queue.Empty:
